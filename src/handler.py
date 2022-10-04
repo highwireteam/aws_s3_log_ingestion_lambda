@@ -108,6 +108,16 @@ def _isCloudTrail(key=None, regex_pattern=None):
 
     return bool(re.search(regex_pattern, key))
 
+def _isALB(key=None, regex_pattern=None):
+    """
+    This functions checks whether this log file is an ALB log based on regex pattern.
+    """
+    if not regex_pattern:
+        regex_pattern = _get_optional_env(
+            "S3_ALB_LOG_PATTERN", ".*elasticloadbalancing.*\.log.gz$")
+
+    return bool(re.search(regex_pattern, key))
+
 def _convert_float(s):
     try:
         f = float(s)
@@ -179,7 +189,7 @@ def _compress_payload(data):
     return payload
 
 
-def _package_log_payload(data):
+def _package_log_payload(data, key):
     """
     Packages up a MELT request for log messages
     """
@@ -187,7 +197,12 @@ def _package_log_payload(data):
     log_messages = []
 
     for line in logLines:
-        log_messages.append({'message': line})
+        if _isALB(key):
+            # This is an ALB log - we need to apply special preprocessing
+            timestamp = time.mktime(parser.parse(line.split()[1]).timetuple())
+            log_messages.append({'message': line, 'timestamp': timestamp})
+        else:
+            log_messages.append({'message': line})
     attributes = {
         "plugin": LOGGING_PLUGIN_METADATA,
         "aws": {
@@ -259,8 +274,8 @@ async def send_log(session, url, data, headers):
     raise MaxRetriesException()
 
 
-def create_log_payload_request(data, session):
-    payload = _package_log_payload(data)
+def create_log_payload_request(data, session, key):
+    payload = _package_log_payload(data, key)
     payload = _compress_payload(payload)
     req = create_request(payload)
     return send_log(session, req.get_full_url(), req.data, req.headers)
@@ -308,7 +323,7 @@ async def _fetch_data_from_s3(bucket, key, context):
                 if log_batch_size > (MAX_BATCH_SIZE * BATCH_SIZE_FACTOR):
                     logger.debug(f"sending batch: {batch_counter} log_batch_size: {log_batch_size}")
                     data = {"context": s3MetaData, "entry": log_batches}
-                    batch_request.append(create_log_payload_request(data, session))
+                    batch_request.append(create_log_payload_request(data, session, key))
                     if len(batch_request) >= REQUEST_BATCH_SIZE:
                         await asyncio.gather(*batch_request)
                         batch_request = []
@@ -316,7 +331,7 @@ async def _fetch_data_from_s3(bucket, key, context):
                     log_batch_size = 0
                     batch_counter += 1
         data = {"context": s3MetaData, "entry": log_batches}
-        batch_request.append(create_log_payload_request(data, session))
+        batch_request.append(create_log_payload_request(data, session, key))
         logger.info("Sending data to NR logs.....")
         output = await asyncio.gather(*batch_request)
         end = time.time()
