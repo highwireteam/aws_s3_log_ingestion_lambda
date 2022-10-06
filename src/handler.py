@@ -118,6 +118,17 @@ def _isALB(key=None, regex_pattern=None):
 
     return bool(re.search(regex_pattern, key))
 
+def _isCloudFront(key=None, regex_pattern=None):
+    """
+    This functions checks whether this log file is an Cloudfront log based on regex pattern.
+    Something like this: "E11WBCCLFVNPJW.2022-10-04-20.d8d16143.gz"
+    """
+    if not regex_pattern:
+        regex_pattern = _get_optional_env(
+            "S3_CLOUDFRONT_LOG_PATTERN", "[A-Z0-9]{14}\.[0-9-]+\..*.gz$")
+
+    return bool(re.search(regex_pattern, key))
+
 def _convert_float(s):
     try:
         f = float(s)
@@ -142,11 +153,19 @@ def _get_license_key(license_key=None):
     return _get_optional_env("LICENSE_KEY", "")
 
 
-def _get_log_type(log_type=None):
+def _get_log_type(key, log_type=None):
     """
     This functions gets the New Relic logtype from env vars.
+    - If we aren't setting one via the env. determine if for each log file automatically
+      or fallback to the default behavior of not passing one
     """
-    return log_type or _get_optional_env("LOG_TYPE", "")
+    if _get_optional_env("LOG_TYPE", "") == "":
+        if _isALB(key):
+            return "alb"
+        elif _isCloudFront(key):
+            return "cloudfront-web"
+    else:
+        return log_type or _get_optional_env("LOG_TYPE", "")
 
 
 def _setting_console_logging_level():
@@ -197,9 +216,16 @@ def _package_log_payload(data, key):
     log_messages = []
 
     for line in logLines:
-        if _isALB(key):
-            # This is an ALB log - we need to apply special preprocessing
+        # With certain logs we need to apply preprocessing to extract the datetime & send each log annotated with a timestamp
+        # This ensures logs are accurately displayed in newrelic
+        if line.startswith('#'):
+            # Skip comment / header lines
+            continue
+        elif _isALB(key):
             timestamp = time.mktime(parser.parse(line.split()[1]).timetuple())
+            log_messages.append({'message': line, 'timestamp': timestamp})
+        elif _isCloudFront(key):
+            timestamp = time.mktime(parser.parse(line.split()[0] + " " + line.split()[1]).timetuple())
             log_messages.append({'message': line, 'timestamp': timestamp})
         else:
             log_messages.append({'message': line})
@@ -209,7 +235,7 @@ def _package_log_payload(data, key):
             "invoked_function_arn": data["context"]["invoked_function_arn"],
             "s3_bucket_name": data["context"]["s3_bucket_name"],
             "s3_key": data["context"]["s3_key"]},
-        "logtype": _get_log_type()
+        "logtype": _get_log_type(key)
     }
     packaged_payload = [
         {
